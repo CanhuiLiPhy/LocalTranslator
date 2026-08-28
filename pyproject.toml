@@ -1,0 +1,97 @@
+[project]
+name = "local-translator"
+# 单一版本号来源：src/local_translator/__init__.py 的 __version__ 由 hatch 从这里读取，
+# 应用包的 Info.plist 也读同一处，三处不会各走各的。
+# Single source of truth: __version__ is read from here by hatch and the app
+# bundle's Info.plist reads the same value, so the three cannot drift.
+dynamic = ["version"]
+description = "Local PDF translation and bilingual reader, powered by BabelDOC"
+readme = "README.md"
+# 3.14 breaks BabelDOC, which subclasses concurrent.futures' private _WorkItem
+# and passes it five arguments; 3.14 changed that signature to take three, and
+# the import fails with a TypeError before any translation starts. The failure
+# is silent until run time and platform-dependent in practice: this project was
+# developed on 3.12 and only met 3.14 the first time uv resolved an interpreter
+# on a machine that had no 3.12, which happened to be the first Windows build.
+# `.python-version` pins what uv installs; this bound is what stops a machine
+# without that file from resolving to an interpreter the code cannot use.
+# 3.14 会让 BabelDOC 崩掉：它继承了 concurrent.futures 的私有类 _WorkItem 并传五个参数，
+# 而 3.14 把该签名改成了三个，导入阶段就以 TypeError 失败，翻译根本来不及开始。这个故障在
+# 运行前不可见，实际表现还与平台有关：本项目在 3.12 上开发，第一次遇到 3.14 是 uv 在一台
+# 没有 3.12 的机器上解析解释器时装的——那正是第一次 Windows 构建。
+# .python-version 决定 uv 装哪一个；这条下界与上界则用于拦住没有该文件的机器，避免它解析
+# 到一个代码用不了的解释器。
+requires-python = ">=3.12,<3.14"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["pdf", "translation", "babeldoc", "bilingual", "llm"]
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Linguistic",
+    "Environment :: MacOS X",
+]
+dependencies = [
+    "babeldoc==0.6.4",
+    "nicegui>=2.10.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "httpx>=0.28.0",
+    "openai>=1.60.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "typer>=0.15.0",
+    "keyring>=25.0.0",
+    "pymupdf>=1.26.0",
+    "tqdm>=4.67.0",
+]
+
+# Optional extras / 可选组件
+#   native — a desktop window instead of a browser tab. pywebview wraps the
+#            system WKWebView on macOS, so it adds a window but no browser
+#            engine. Optional because the application is complete without it.
+#   native — 独立桌面窗口而非浏览器标签页。pywebview 在 macOS 上包装系统的
+#            WKWebView，只增加一个窗口、不带浏览器内核。设为可选是因为不装也完全可用。
+[project.optional-dependencies]
+native = ["pywebview>=5.0"]
+
+[tool.pytest.ini_options]
+# Only the test suite. Without this a bare `pytest` walks the whole tree and
+# collects `scratch/`, where the throwaway probes live — one of them calls
+# `sys.exit(1)` at import time, which aborts the entire run with an
+# INTERNALERROR before a single test executes.
+# 只收测试目录。不写这一条，裸跑 pytest 会遍历整棵树、把 scratch/ 里的一次性实验脚本也收
+# 进来——其中一个在导入时就调用 sys.exit(1)，会让整轮以 INTERNALERROR 中止，一个测试都跑
+# 不到。
+testpaths = ["tests"]
+
+[project.scripts]
+localtrans = "local_translator.cli:app"
+
+[project.gui-scripts]
+# A GUI script gets no console window, which is what distinguishes it from the
+# command above. `localtrans app` opens the same desktop window through the
+# ordinary command; this entry exists for launchers that want no console.
+# GUI 脚本不带控制台窗口，这是它与上面那条的区别。`localtrans app` 用普通命令也能打开
+# 同一个桌面窗口；这一条是留给不想要控制台的启动器用的。
+localtrans-app = "local_translator.desktop:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/local_translator/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_translator"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: typer's documented idiom is to call Option()/Argument() in defaults.
+# B008：typer 的官方写法就是在默认值里调用 Option()/Argument()。
+ignore = ["E501", "B008"]
