@@ -582,7 +582,7 @@ def anchored_citation(anchors, paragraph, page) -> bool:
     if box is None:
         return False
     try:
-        return anchors.is_citation(page.page_number, box.y, box.y2)
+        return anchors.is_citation(page.page_number, box.y, box.y2, box.x, box.x2)
     except Exception:  # noqa: BLE001
         return False
 

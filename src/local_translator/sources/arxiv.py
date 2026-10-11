@@ -15,6 +15,7 @@ the API gives the canonical title and author list.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -26,6 +27,25 @@ import httpx
 logger = logging.getLogger(__name__)
 
 ARXIV_API = "https://export.arxiv.org/api/query"
+
+# arXiv asks automated clients to identify themselves and to leave three
+# seconds between queries. A generic client is rate-limited harder — the same
+# lesson the Wikidata seeding pass learned, where an unidentified agent got a
+# 429 on every request.
+# arXiv 要求自动客户端标明身份，并在两次查询之间留出三秒。通用标识会被更严格地限流
+# ——这与当初 Wikidata 种子导入学到的教训相同：不标明身份时每个请求都返回 429。
+_USER_AGENT = ("LocalTranslator/1.0 (academic paper translation tool; "
+               "https://github.com/CanhuiLiPhy/LocalTranslator) python-httpx")
+
+# How long to wait before retrying a rate-limited lookup, in seconds. arXiv's
+# published limit is one query every three seconds; a burst of submissions
+# trips it, and the 429 it answers with carries no Retry-After, so the schedule
+# is ours to pick. Three seconds is the documented interval; doubling twice
+# covers a short block without making a failed lookup feel hung.
+# 被限流后重试前等待多久（秒）。arXiv 公布的限额是每三秒一次查询；连续提交几篇就会
+# 触发，而它返回的 429 不带 Retry-After，因此节奏由我们自己定。三秒是官方标明的间隔，
+# 再翻倍两次足以熬过一次短暂封锁，又不会让一次失败的查询显得卡死。
+_RETRY_WAITS = (3.0, 6.0, 12.0)
 
 # Modern identifiers look like 2510.04704 or 2510.04704v4; historical ones like
 # math.GT/0309136. Both forms may be wrapped in an abs/pdf URL.
@@ -115,13 +135,32 @@ async def fetch_metadata(arxiv_id: str, timeout: float = 30.0) -> dict[str, str]
         "abs_url": f"https://arxiv.org/abs/{arxiv_id}",
     }
 
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            resp = await client.get(ARXIV_API, params={"id_list": arxiv_id, "max_results": 1})
-            resp.raise_for_status()
-            root = ET.fromstring(resp.text)
-    except Exception:
-        logger.warning("arXiv metadata lookup failed for %s", arxiv_id, exc_info=True)
+    params = {"id_list": arxiv_id, "max_results": 1}
+    root = None
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
+                                 headers={"User-Agent": _USER_AGENT}) as client:
+        for attempt, wait in enumerate((*_RETRY_WAITS, None)):
+            try:
+                resp = await client.get(ARXIV_API, params=params)
+                resp.raise_for_status()
+                root = ET.fromstring(resp.text)
+                break
+            except httpx.HTTPStatusError as exc:
+                # Only a rate limit is worth waiting out. A 404 means the
+                # identifier is wrong and will still be wrong in three seconds.
+                # 只有限流值得等。404 说明编号本身不对，三秒后依然不对。
+                if exc.response.status_code != 429 or wait is None:
+                    logger.warning("arXiv metadata lookup failed for %s: HTTP %s",
+                                   arxiv_id, exc.response.status_code)
+                    return fallback
+                logger.info("arXiv rate-limited %s; retrying in %.0fs (attempt %d)",
+                            arxiv_id, wait, attempt + 1)
+                await asyncio.sleep(wait)
+            except Exception:
+                logger.warning("arXiv metadata lookup failed for %s", arxiv_id,
+                               exc_info=True)
+                return fallback
+    if root is None:
         return fallback
 
     entry = root.find(f"{_ATOM}entry")
@@ -218,8 +257,53 @@ async def fetch_arxiv(reference: str, library_dir: Path) -> ArxivPaper:
 
     return ArxivPaper(
         arxiv_id=arxiv_id,
-        title=meta["title"],
+        title=title_from(meta, pdf_path, arxiv_id),
         authors=meta["authors"],
         abs_url=meta["abs_url"],
         pdf_path=pdf_path,
     )
+
+
+def title_from(meta: dict[str, str], pdf_path: Path, arxiv_id: str) -> str:
+    """
+    中文：拿不到 API 标题时，退而从已下载的 PDF 里读，最后才用编号。
+
+    Choose the best title available, falling back to the downloaded PDF.
+
+    ``fetch_metadata`` answers with the identifier as the title when the API
+    is unreachable, and arXiv rate-limits a burst of submissions hard enough
+    that this happens in ordinary use: three papers queued in one sitting left
+    「2608.23566」 sitting in the library where a title belonged. The PDF is on
+    disk by the time this runs and carries the real title in its own metadata,
+    so a network failure no longer costs the reader the name of their paper.
+
+    Args:
+        meta (dict[str, str]): Result of :func:`fetch_metadata`, whose
+            ``title`` equals ``arxiv_id`` exactly when the lookup failed.
+        pdf_path (Path): The downloaded PDF.
+        arxiv_id (str): Identifier, used as the last resort.
+
+    Returns:
+        str: The API title when there is one; otherwise the PDF's embedded
+            title if it looks like a real one; otherwise the identifier.
+    """
+    title = (meta.get("title") or "").strip()
+    if title and title != arxiv_id:
+        return title
+
+    from local_translator.library import read_pdf_metadata
+
+    try:
+        embedded = str(read_pdf_metadata(pdf_path).get("title") or "").strip()
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not read a title out of %s", pdf_path, exc_info=True)
+        return arxiv_id
+    # Producers leave junk in this field — a LaTeX job name, "untitled", the
+    # file's own name. A real title has spaces in it and is not the identifier.
+    # 生成器常在这个字段里留下垃圾：LaTeX 的 job name、「untitled」、文件名本身。
+    # 真正的标题带空格，且不等于编号。
+    if len(embedded) >= 12 and " " in embedded and arxiv_id not in embedded:
+        logger.info("arXiv metadata unavailable; using the PDF's own title for %s",
+                    arxiv_id)
+        return embedded
+    return arxiv_id

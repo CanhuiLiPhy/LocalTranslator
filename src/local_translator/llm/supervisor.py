@@ -141,7 +141,7 @@ class LlamaServerSupervisor:
             import httpx
 
             reply = httpx.get(f"http://{self.settings.host}:{self.settings.port}/slots",
-                              timeout=timeout)
+                              timeout=timeout, trust_env=False)
             if reply.status_code != 200:
                 return None
             slots = reply.json()

@@ -113,11 +113,13 @@ def _operators_only(text: str) -> bool:
 _OPENERS = "([{"
 _CLOSERS = ")]}"
 
-# How far apart two pieces may be and still be one formula, in points. Generous
-# enough for a fraction's numerator and denominator, which are a line apart, and
-# far short of the distance to the next formula in a sentence.
-# 两块相距多远仍算作一个公式（点）。足够容纳分数的分子与分母——它们相隔一行——又远小于
-# 一个句子里到下一个公式的距离。
+# How far apart two pieces may be *horizontally* and still be one formula, in
+# points: wide enough for the operator or punctuation that separates them, far
+# short of the distance to the next formula in a sentence. Vertically the two
+# must overlap — see :func:`_near` — so this bound applies along the line only.
+# 两块在**横向**上相距多远仍算作一个公式（点）：足够容纳夹在中间的算子或标点，又远小于
+# 一个句子里到下一个公式的距离。纵向上两者必须重叠——见 :func:`_near`——因此这个界限
+# 只沿着行的方向起作用。
 _NEAR = 28.0
 
 # Set LOCALTRANS_GAP_PROBE=1 to log the text between every pair of formula
@@ -300,6 +302,49 @@ def _open_brackets(text: str) -> int:
     return depth
 
 
+def _stays_open(run_text: str, gap_text: str) -> bool:
+    """
+    中文：判断运行串已打开的括号是否穿过整个间隙仍未闭合。
+
+    Decide whether a bracket the run has opened survives the whole gap.
+
+    The bracket rule may absorb prose only while the run is still inside a
+    bracketed unit. That has two halves, and each was once a bug of its own:
+    an opener at the END of the gap belongs to the unit after it (handled by
+    counting depth over the run alone), and a closer at the START of the gap
+    ends the unit before any of the gap's words (handled here). 「Rxy(H)
+    curves, where H is …」 is the measured failure of the second half: the run
+    「Rxy(H」 carries an open bracket, the gap 「) curves, where 」 closes it at
+    its first character, and a depth test that never looks inside the gap
+    swallowed fifteen characters of prose and the next variable into one
+    placeholder — printed untranslated, twice.
+
+    Args:
+        run_text (str): Text of the formula characters absorbed so far.
+        gap_text (str): Text lying between the run and the next formula piece.
+
+    Returns:
+        bool: ``True`` when the run's bracket depth is positive before the gap
+            and never touches zero at any point within it. A depth that
+            reaches zero — even at the gap's last character — means the unit
+            is complete and the words after the closer belong to the sentence,
+            not the formula. Reopened brackets later in the gap do not revive
+            the run: like the opener-at-the-end case, they belong to the unit
+            after it.
+    """
+    depth = _open_brackets(run_text)
+    if depth <= 0:
+        return False
+    for char in gap_text:
+        if char in _OPENERS:
+            depth += 1
+        elif char in _CLOSERS:
+            depth -= 1
+            if depth <= 0:
+                return False
+    return True
+
+
 def _union(first, second):
     """
     中文：求两个框的外接框，用来跟踪一串公式已经长到哪里。
@@ -345,7 +390,36 @@ def _near(first, second, *, bracketed: bool = False) -> bool:
     if first is None or second is None:
         return False
     gap_x = max(second.x - first.x2, first.x - second.x2, 0.0)
-    gap_y = max(second.y - first.y2, first.y - second.y2, 0.0)
+    # Whether the two sit on the same line, measured by how much of their
+    # height they share.
+    #
+    # Neither of the two obvious tests works. A vertical *gap* of zero does not
+    # mean "same line": consecutive lines have touching bounding boxes, so the
+    # gap is 0 between them exactly as it is between neighbours on one line.
+    # And ``line_id`` does not mean it either — on the paragraph below every
+    # piece carries line_id 2, across three printed lines — because it numbers
+    # the lines of a paragraph's own composition, not the lines of the page.
+    #
+    # What does separate them is the *share* of height in common. Measured on
+    # arXiv:2608.09438 page 4, where a sentence names seven gradients in a row:
+    # two pieces on one line have boxes 480.7-496.8 and 480.7-496.8, sharing
+    # all 16.1 points, while the piece that wrapped to the next line is at
+    # 466.0-480.8 and shares 0.1 — the width of the rounding between two
+    # touching boxes. Half the shorter box's height sits far from both.
+    # 两块是否在同一行，用它们共享了多少高度来衡量。
+    #
+    # 两个看似显然的判据都不成立。纵向**间隙**为零并不意味着「同一行」：相邻文字行的
+    # 包围盒是相接的，行与行之间的间隙与同一行上邻居之间同样都是 0。line_id 也不意味着
+    # 同一行——下面那个段落里每一块的 line_id 都是 2，却横跨三个印出来的行——因为它编的
+    # 是段落自身组成单元的行号，不是页面上的行。
+    #
+    # 真正能区分的是共享高度的**占比**。arXiv:2608.09438 第 4 页那句连写七个梯度的话
+    # 实测：同一行的两块框为 480.7-496.8 与 480.7-496.8，16.1 点全部共享；而换到下一行
+    # 的那块在 466.0-480.8，只共享 0.1 点——那是两个相接的框之间的舍入宽度。取较矮那个
+    # 框高度的一半作界，离两者都很远。
+    shared = min(first.y2, second.y2) - max(first.y, second.y)
+    shortest = min(first.y2 - first.y, second.y2 - second.y)
+    same_line = shortest > 0 and shared >= shortest / 2
     if bracketed:
         # The bracket rule may reach across a phrase, never across a line break.
         #
@@ -373,8 +447,31 @@ def _near(first, second, *, bracketed: bool = False) -> bool:
         # 要求两个框在纵向上有重叠，就把这条规则限制在了一行之内。它本来要保住的
         # 「[Theorem 4, MP09]」在同一行上、框高十点，不受影响。真正换行的引用会保持两段，
         # 虽不理想，但读起来是对的。
-        return gap_x <= _NEAR_BRACKET_X and gap_y <= 0.0
-    return gap_x <= _NEAR and gap_y <= _NEAR
+        return gap_x <= _NEAR_BRACKET_X and same_line
+
+    # The glue rule may not cross a line break either, for the same reason and
+    # with the same evidence. A comma is glue, and a sentence naming seven
+    # gradients in a row — 「∂L/∂W_ffm, ∂L/∂W_att, … ∂L/∂W_γ2」 on page 4 of
+    # arXiv:2608.09438 — wraps across three source lines. Merging through the
+    # commas built one formula 251 points wide and 30.8 points tall, three
+    # lines' worth, which is unplaceable: the typesetter put it over the
+    # Chinese around it, and because the run collapsed into a single
+    # placeholder the model was handed 「{v4}, , etc.」 and had nothing to put
+    # the other six formulas back into.
+    #
+    # A fraction is unaffected. Its numerator and denominator are one formula
+    # by the time this runs — BabelDOC's own merge_overlapping_formulas joins
+    # them, having the line_id to prove they belong together — so this pass
+    # never sees the two halves as separate pieces to bridge.
+    # 胶水规则同样不得跨越换行，理由与证据都与上面那条相同。逗号是胶水，而一句连写
+    # 七个梯度的话——arXiv:2608.09438 第 4 页的「∂L/∂W_ffm, ∂L/∂W_att, … ∂L/∂W_γ2」
+    # ——在源文里横跨三行。顺着逗号合并会造出一条宽 251 点、高 30.8 点即三行高的公式，
+    # 根本摆不下：排版器把它压在了周围的中文上；而且整串塌缩成一个占位符之后，模型拿到
+    # 的是「{v4}, , etc.」，另外六个公式无处可放。
+    #
+    # 分数不受影响：轮到本函数时它的分子与分母早已是一条公式——BabelDOC 自己的
+    # merge_overlapping_formulas 凭 line_id 把它们合过了——本遍根本看不到需要跨接的两半。
+    return gap_x <= _NEAR and same_line
 
 
 def _mergeable(characters) -> bool:
@@ -604,6 +701,137 @@ def _extend_over_rules(stage, page, paragraph) -> int:
     return extended
 
 
+def _holder(composition):
+    """
+    中文：取出文字组成单元里真正持有字符列表的对象，以便原地增删。
+
+    Return the object that owns a text composition's character list.
+
+    ``_characters`` copies, which is right for reading; moving a character out
+    of a composition needs the list itself.
+
+    Args:
+        composition (PdfParagraphComposition): One element of a paragraph.
+
+    Returns:
+        object | None: The holder with a mutable ``pdf_character`` list, or
+            ``None`` when the composition is a formula or a bare character —
+            shapes this pass does not edit.
+    """
+    for name in ("pdf_line", "pdf_same_style_characters"):
+        holder = getattr(composition, name, None)
+        if holder is not None and getattr(holder, "pdf_character", None):
+            return holder
+    return None
+
+
+def _unclosed(text: str) -> list[str]:
+    """
+    中文：返回一段文字里尚未闭合的左括号栈，按打开顺序排列。
+
+    Return the stack of a text's unmatched opening brackets.
+
+    Args:
+        text (str): Text to scan.
+
+    Returns:
+        list[str]: The openers still waiting for their closer, oldest first —
+            the last element is the one the next closer must match. A stray
+            closer with an empty or mismatched stack is ignored: it belongs to
+            something outside this text.
+    """
+    stack: list[str] = []
+    for char in text:
+        if char in _OPENERS:
+            stack.append(char)
+        elif char in _CLOSERS:
+            if stack and _OPENERS.index(stack[-1]) == _CLOSERS.index(char):
+                stack.pop()
+    return stack
+
+
+def _close_brackets(stage, paragraph) -> int:
+    """
+    中文：把紧跟在未闭合公式后面的配对闭括号并回公式里。
+
+    Pull a matching closer that immediately follows an unclosed formula back
+    into that formula.
+
+    The gap gate stops the bracket rule at a closer, which is correct for the
+    words after it — but it leaves the formula itself half-open: 「Rxy(H」 with
+    the 「)」 stranded as the first character of the prose that follows. A
+    model shown a paragraph beginning with a stray closer reads it as noise
+    and drops it, so the printed page shows 「Rxy(H曲线」 with no closing
+    bracket at all. The same shape comes out of BabelDOC's own segmentation
+    wherever an upright closer follows an italic argument — 「G(α,β」,
+    「S(τ」, 「α(0」 — so this runs over every formula, not only the merged
+    ones.
+
+    Only the tightest case is taken: the closer must be the *first* character
+    of the very next text composition, must match the formula's innermost open
+    bracket, and must sit on the formula's own line — a closer that wrapped to
+    the next line would stretch the formula's box a line tall, and a box that
+    tall cannot be placed inline.
+
+    Args:
+        stage (StylesAndFormulas): BabelDOC's stage, for its box computation.
+        paragraph (PdfParagraph): Paragraph whose compositions are edited in
+            place.
+
+    Returns:
+        int: How many characters were moved into formulas.
+    """
+    compositions = paragraph.pdf_paragraph_composition or []
+    moved_total = 0
+    for i in range(len(compositions) - 1):
+        comp = compositions[i]
+        formula = getattr(comp, "pdf_formula", None)
+        if formula is None or not formula.pdf_character or formula.box is None:
+            continue
+        stack = _unclosed(_text(formula.pdf_character))
+        if not stack:
+            continue
+        holder = _holder(compositions[i + 1])
+        if holder is None:
+            continue
+        chars = holder.pdf_character
+        moved = []
+        while stack and chars:
+            char = chars[0]
+            text = char.char_unicode or ""
+            if (text in _CLOSERS
+                    and _OPENERS.index(stack[-1]) == _CLOSERS.index(text)
+                    and char.box is not None
+                    and char.box.y < formula.box.y2
+                    and char.box.y2 > formula.box.y):
+                moved.append(chars.pop(0))
+                stack.pop()
+            else:
+                break
+        if not moved:
+            continue
+        if not _mergeable(moved):
+            chars[0:0] = moved
+            continue
+        formula.pdf_character.extend(moved)
+        try:
+            stage.update_formula_data(formula)
+        except Exception:  # noqa: BLE001
+            # 算不出框就整个撤销，让段落保持原样。/ Undo entirely if the box fails.
+            del formula.pdf_character[-len(moved):]
+            chars[0:0] = moved
+            logger.debug("Could not close a formula's bracket", exc_info=True)
+            continue
+        moved_total += len(moved)
+        if _GAPS:
+            logger.warning("CLOSED %r", _text(formula.pdf_character)[-16:])
+        if not chars:
+            compositions[i + 1] = None
+    if moved_total and any(c is None for c in compositions):
+        paragraph.pdf_paragraph_composition = [c for c in compositions if c is not None]
+    return moved_total
+
+
 def _union_of(characters):
     """
     中文：算出一串字符的外接框。
@@ -758,12 +986,36 @@ def _join(stage, paragraph) -> int:
             #
             # 「[Theorem 4, MP09]」不受影响：它的开括号是「[」，本身就是公式字符，从第一步
             # 起就在这一串自己的字符里。
-            inside = _open_brackets(_text(characters)) > 0
+            #
+            # And the mirror image: a closer at the START of the gap ends the
+            # unit before any of the gap's words. 「the slopes of Rxy(H) curves,
+            # where H is the magnetic field strength」 is a formula 「Rxy」, the
+            # glue 「(」, a formula 「H」, the gap 「) curves, where 」 and a
+            # formula 「H」. The glue step legitimately builds the run 「Rxy(H」,
+            # whose bracket is open — but the gap's first character closes it,
+            # so 「curves, where」 is prose after a complete unit, not the inside
+            # of one. A depth test on the run alone cannot see that; the gap
+            # must be scanned too, which is what _stays_open does. The shape —
+            # f(x) followed by prose and another variable — is the 「where x
+            # is …」 idiom of every physics paper.
+            # 与之成镜像的另一半：位于间隙**开头**的闭括号，在间隙的任何一个词之前就已把
+            # 单元结束了。「the slopes of Rxy(H) curves, where H is the magnetic
+            # field strength」切出来是：公式「Rxy」、胶水「(」、公式「H」、间隙
+            # 「) curves, where 」、公式「H」。胶水一步合法地拼出带开括号的「Rxy(H」——
+            # 但间隙的第一个字符就把它闭合了，「curves, where」是完整单元之后的行文，
+            # 不是单元内部。只看运行串的深度测试看不见这一点，必须把间隙也扫一遍，
+            # 这就是 _stays_open 做的事。这种形状——f(x) 后接行文再接另一个变量——正是
+            # 物理论文里随处可见的「where x is …」句式。
+            inside = _stays_open(_text(characters), gap_text)
             if _GAPS:
-                logger.warning("GAP %r after %r before %r glued=%s inside=%s",
+                logger.warning("GAP %r after %r before %r glued=%s inside=%s"
+                               " | y %.1f-%.1f → %.1f-%.1f",
                                gap_text, _text(characters)[-14:],
                                _text(candidate.pdf_formula.pdf_character or [])[:14],
-                               glued, inside)
+                               glued, inside,
+                               frontier.y, frontier.y2,
+                               candidate.pdf_formula.box.y,
+                               candidate.pdf_formula.box.y2)
             if not (glued or inside):
                 break
             if not glued:
@@ -865,6 +1117,7 @@ def install() -> None:
                     _probe_extent(page, paragraph)
                 merged += _extend_over_rules(self, page, paragraph)
                 merged += _join(self, paragraph)
+                merged += _close_brackets(self, paragraph)
             except Exception:  # noqa: BLE001
                 logger.debug("Neighbour merging failed for a paragraph", exc_info=True)
         if merged:

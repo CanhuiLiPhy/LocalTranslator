@@ -40,7 +40,9 @@ from local_translator.service import (
     get_service,
 )
 from local_translator.web.format import (
+    UNSUCCESSFUL,
     human_bytes,
+    local_time,
     short_path,
     status_label,
     usage_line,
@@ -1155,25 +1157,53 @@ def library_page() -> None:
 
     with _page_body():
 
-        # Which rows are ticked, and whether the batch is in selection mode.
-        # Held outside the refreshable so a redraw does not lose the selection.
-        # 勾选了哪些行、是否处于多选状态。放在 refreshable 之外，重绘时不会丢掉选择。
-        state = {"selecting": False, "chosen": set()}
+        # Which rows are ticked, whether the batch is in selection mode, and
+        # what the reader is searching for. Held outside the refreshable so a
+        # redraw loses neither the selection nor the query.
+        # 勾选了哪些行、是否处于多选状态、以及正在搜什么。放在 refreshable 之外，
+        # 重绘时既不丢选择也不丢查询。
+        state = {"selecting": False, "chosen": set(), "query": "", "status": "all"}
 
-        @ui.refreshable
-        def table() -> None:
-            """中文：渲染文档列表。 / Render the document list."""
-            documents = service.documents()
-            known = {d["id"] for d in documents}
-            state["chosen"] &= known
+        with ui.card().classes(CARD):
+            # The search controls live outside the refreshable: rebuilding an
+            # input on every keystroke would take the focus away from it.
+            # 搜索控件放在 refreshable 之外：每敲一个键就重建输入框，焦点会被夺走。
+            with ui.row().classes("items-center gap-2 mb-3 w-full"):
+                ui.label("历史").classes(HEADING)
 
-            with ui.card().classes(CARD):
+                def on_query(event) -> None:
+                    """中文：记下查询词并重绘列表。 / Store the query and redraw."""
+                    state["query"] = (event.value or "").strip()
+                    table.refresh()
+
+                ui.input(placeholder="搜索标题、作者、日期、来源…",
+                         on_change=on_query).props(
+                    f"{INPUT_PROPS} clearable debounce=200").classes("flex-1 max-w-md")
+
+                def on_status(event) -> None:
+                    """中文：切换状态筛选。 / Switch the status filter."""
+                    state["status"] = event.value or "all"
+                    table.refresh()
+
+                ui.select(_STATUS_FILTERS, value="all", on_change=on_status).props(
+                    INPUT_PROPS).classes("w-36")
+
+            @ui.refreshable
+            def table() -> None:
+                """中文：渲染文档列表。 / Render the document list."""
+                documents = service.documents()
+                known = {d["id"] for d in documents}
+                state["chosen"] &= known
+                shown = [d for d in documents if _matches(d, state)]
+
                 with ui.row().classes("items-center gap-2 mb-4 w-full"):
-                    ui.label("历史").classes(HEADING)
-                    ui.label(f"{len(documents)} 个文档").classes(MUTED)
+                    if len(shown) == len(documents):
+                        ui.label(f"{len(documents)} 个文档").classes(MUTED)
+                    else:
+                        ui.label(f"匹配 {len(shown)} / {len(documents)} 个文档").classes(MUTED)
                     ui.space()
-                    if documents:
-                        _library_toolbar(service, documents, state, table.refresh)
+                    if shown:
+                        _library_toolbar(service, shown, state, table.refresh)
 
                 if not documents:
                     with ui.column().classes("w-full items-center py-10 gap-2"):
@@ -1183,11 +1213,66 @@ def library_page() -> None:
                             "flat"
                         )
                     return
+                if not shown:
+                    with ui.column().classes("w-full items-center py-10 gap-2"):
+                        ui.icon("search_off", size="2rem").classes("text-gray-300")
+                        ui.label("没有匹配的文档").classes("text-sm text-gray-400")
+                    return
 
-                for doc in documents:
+                for doc in shown:
                     _document_row(service, doc, table.refresh, state)
 
-        table()
+            table()
+
+
+# Status filter choices on the history page. "bad" is what a reader wants to
+# find in one go: the papers that need redoing.
+# 历史页的状态筛选项。「失败/取消」是读者想一把抓出来的：需要重来的那些。
+_STATUS_FILTERS = {
+    "all": "全部状态",
+    "completed": "已完成",
+    "bad": "失败/取消",
+    "active": "排队/翻译中",
+}
+
+
+def _matches(doc: dict, state: dict) -> bool:
+    """
+    中文：判断一条历史记录是否满足当前的搜索词与状态筛选。
+
+    Decide whether a document row passes the history page's search and filter.
+
+    Args:
+        doc (dict): Document row as returned by ``service.documents()``.
+        state (dict): Page state carrying ``query`` (free text) and ``status``
+            (a key of :data:`_STATUS_FILTERS`).
+
+    Returns:
+        bool: ``True`` when every whitespace-separated term of the query
+            occurs, case-insensitively, somewhere in the title, the authors,
+            the source reference, the source file name, the local creation
+            time or the Chinese status label — and the status filter admits
+            the row. An empty query matches everything.
+    """
+    status = doc.get("last_status") or ""
+    wanted = state.get("status", "all")
+    if wanted == "completed" and status != "completed":
+        return False
+    if wanted == "bad" and status not in UNSUCCESSFUL:
+        return False
+    if wanted == "active" and status not in ("queued", "running"):
+        return False
+
+    terms = (state.get("query") or "").lower().split()
+    if not terms:
+        return True
+    haystack = " ".join(filter(None, (
+        doc.get("title"), doc.get("authors"), doc.get("source_ref"),
+        Path(doc.get("source_path") or "").name,
+        local_time(doc.get("created_at")),
+        status_label(status)[0] if status else "",
+    ))).lower()
+    return all(term in haystack for term in terms)
 
 
 def _library_toolbar(service, documents, state, refresh) -> None:
@@ -1225,6 +1310,21 @@ def _library_toolbar(service, documents, state, refresh) -> None:
 
     ui.button("全选" if len(chosen) < len(documents) else "全不选",
               on_click=all_or_none).props("flat dense no-caps size=sm")
+
+    # One tick for every paper that did not come out: failed, cancelled or
+    # interrupted. Limited to the rows currently listed, so a search narrows
+    # it the same way it narrows select-all.
+    # 一键勾上所有没翻成的：失败、取消、中断。只作用于当前列出的行，搜索缩小范围
+    # 的方式与全选一致。
+    unsuccessful = [d["id"] for d in documents if d.get("last_status") in UNSUCCESSFUL]
+
+    def pick_unsuccessful() -> None:
+        """中文：勾上全部失败/取消的条目。 / Tick every unsuccessful entry."""
+        chosen.update(unsuccessful)
+        refresh()
+
+    ui.button(f"选中失败/取消 ({len(unsuccessful)})", on_click=pick_unsuccessful).props(
+        "flat dense no-caps size=sm").set_enabled(bool(unsuccessful))
 
     async def remove() -> None:
         """中文：删掉选中的条目。 / Remove the ticked entries."""
@@ -1399,6 +1499,10 @@ def _document_row(service: TranslatorService, doc: dict, refresh,
                 ).classes("text-[#c0392b]").tooltip("从历史中删除")
 
         with ui.row().classes("items-center gap-4 flex-wrap"):
+            ui.label(local_time(doc.get("created_at"))).classes(MUTED)
+            if doc.get("authors"):
+                ui.label(doc["authors"]).classes(f"{MUTED} truncate max-w-xs").tooltip(
+                    doc["authors"])
             ui.label(short_path(doc.get("source_path"), keep=3)).classes(MUTED)
             if doc.get("page_count"):
                 ui.label(f"{doc['page_count']} 页").classes(MUTED)

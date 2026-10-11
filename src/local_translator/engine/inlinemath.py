@@ -292,6 +292,78 @@ def formula_islands(tagged: list, italic_ids: set) -> list:
     return [(item[0], flags[i], item[2]) for i, item in enumerate(tagged)]
 
 
+def adopt_brackets(tagged: list) -> list:
+    """
+    中文：括号不按自身字体判类——它属于它括住的公式。
+
+    Let a bracket follow its formula instead of its own font.
+
+    A bracket carries no meaning of its own, but the classifier judges it by
+    font like any other character, and brackets are set upright. So
+    ``Rxy(H)`` is born shattered — italic ``Rxy`` and ``H`` are formulas, the
+    upright ``(`` and ``)`` are prose — and every stage downstream then works
+    around the split: the glue merge pulls the opener in because it sits
+    between two formulas, nothing pulls the closer in because prose follows
+    it, and the printed page ends up with half-open formulas. One paper
+    carried ninety of them. The commas inside notation had the same shape of
+    problem — judged as prose by their own look, when they belong to the
+    symbol — and got the same kind of exemption in ``notation.py``.
+
+    Two rules, deliberately narrower than "next to a formula":
+
+    * An **opener** whose immediate neighbours are formula on *both* sides is
+      part of the formula — ``Rxy(H`` — while an opener that faces prose on
+      either side stays prose: the brackets of 「(see Fig. 2)」 belong to the
+      sentence, and the model converts sentence brackets to full-width ones,
+      which a frozen ASCII bracket inside a placeholder would prevent.
+    * A **closer** joins only when the formula run to its left still has an
+      unmatched opener of the same kind — it closes a bracket the formula
+      itself opened. ``2017)`` after a prose year has no such opener and
+      stays prose.
+
+    Args:
+        tagged (list): ``(character, is_formula, is_corner_mark)`` triples for
+            one line.
+
+    Returns:
+        list: The same triples with formula-owned brackets tagged as formula.
+    """
+    formulaish = [bool(item[1]) or bool(item[2]) for item in tagged]
+    promoted: set[int] = set()
+
+    for i, item in enumerate(tagged):
+        text = _text_of(item)
+        if formulaish[i] or len(text) != 1:
+            continue
+        if text in "([{":
+            if 0 < i < len(tagged) - 1 and formulaish[i - 1] and formulaish[i + 1]:
+                promoted.add(i)
+                formulaish[i] = True
+        elif text in ")]}":
+            if i == 0 or not formulaish[i - 1]:
+                continue
+            # 向左取整段公式串，数它自己还开着的括号。
+            # Walk the formula run to the left and count its open brackets.
+            start = i - 1
+            while start > 0 and formulaish[start - 1]:
+                start -= 1
+            stack: list[str] = []
+            for j in range(start, i):
+                char = _text_of(tagged[j])
+                if char in "([{":
+                    stack.append(char)
+                elif char in ")]}" and stack and "([{".index(stack[-1]) == ")]}".index(char):
+                    stack.pop()
+            if stack and "([{".index(stack[-1]) == ")]}".index(text):
+                promoted.add(i)
+                formulaish[i] = True
+
+    if not promoted:
+        return tagged
+    return [(item[0], bool(item[1]) or i in promoted, item[2])
+            for i, item in enumerate(tagged)]
+
+
 def attach_bases(tagged: list) -> list:
     """
     中文：把每串角标前面的基字母也标成公式。
@@ -424,6 +496,7 @@ def install() -> None:
             tagged = italic_variables(tagged, italic)
             tagged = formula_islands(tagged, italic)
             tagged = attach_bases(tagged)
+            tagged = adopt_brackets(tagged)
         except Exception:  # noqa: BLE001
             # A line that cannot be examined keeps its tags, which is how every
             # line behaved before this existed.

@@ -22,6 +22,40 @@ STATUS_LABELS: dict[str, tuple[str, str]] = {
 }
 
 
+# Statuses a reader would call "did not work": the paper needs redoing.
+# 读者眼里「没成」的状态：这篇要重来。
+UNSUCCESSFUL: frozenset[str] = frozenset({"failed", "cancelled", "interrupted"})
+
+
+def local_time(iso: str | None) -> str:
+    """
+    中文：把数据库里的 ISO 时间串转成本地时区的「年-月-日 时:分」。
+
+    Render a stored ISO timestamp in the reader's local time zone.
+
+    The database stores UTC with an explicit offset
+    (``2026-08-28T10:15:02.405191+00:00``); a reader searching for the paper
+    they translated "this morning" thinks in wall-clock time, so the string
+    shown — and matched by the history search — is local.
+
+    Args:
+        iso (str | None): ISO-8601 timestamp, or ``None``.
+
+    Returns:
+        str: ``"2026-08-28 18:15"`` in local time, ``"—"`` for ``None``, and
+            the raw string when it does not parse.
+    """
+    if not iso:
+        return "—"
+    from datetime import datetime
+
+    try:
+        moment = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 def status_label(status: str) -> tuple[str, str]:
     """
     中文：把任务状态码转成中文标签与颜色。

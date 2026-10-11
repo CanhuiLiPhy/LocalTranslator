@@ -205,6 +205,51 @@ def _text(paragraph) -> str:
     return (paragraph.unicode or "").strip()
 
 
+def _prose_words(paragraph) -> int:
+    """
+    中文：数段落里**文字**部分的词数，公式字符不算。
+
+    Count a paragraph's words of prose, leaving formula characters out.
+
+    The length gate below separates a name list from abstract prose, and only
+    the prose belongs in that measurement. On the PRL layout the affiliations
+    are set in the text italic, so they arrive as formula characters *inside*
+    the author paragraph: thirteen words of names carrying ninety-odd words of
+    institutions in their formulas. Counting everything called the authors
+    "too long to be front matter", they were translated as body text, and the
+    re-typeset line printed over the affiliations beneath it.
+
+    Args:
+        paragraph (PdfParagraph): Paragraph to measure.
+
+    Returns:
+        int: Word count over the text compositions only. Falls back to the
+            whole paragraph's text when it has no composition list, which is
+            the same number the gate used before.
+    """
+    compositions = getattr(paragraph, "pdf_paragraph_composition", None)
+    if not compositions:
+        return len(_text(paragraph).split())
+    words = 0
+    for comp in compositions:
+        if getattr(comp, "pdf_formula", None) is not None:
+            continue
+        chars = None
+        for name in ("pdf_line", "pdf_same_style_characters"):
+            holder = getattr(comp, name, None)
+            if holder is not None:
+                chars = holder.pdf_character
+                break
+        if chars is None:
+            single = getattr(comp, "pdf_character", None)
+            chars = [single] if single is not None else []
+            styled = getattr(comp, "pdf_same_style_unicode_characters", None)
+            if styled is not None:
+                words += len((styled.unicode or "").split())
+        words += len("".join(c.char_unicode or "" for c in chars).split())
+    return words
+
+
 def _size(paragraph) -> float:
     """
     中文：取段落基准字号。
@@ -350,7 +395,7 @@ def _classify_front_matter(page, boundary: float) -> None:
             continue
         if titled and _size(paragraph) >= largest - _TITLE_SLACK:
             _CLASSIFIED[key] = "document_title"
-        elif len(_text(paragraph).split()) > _MAX_FRONT_WORDS:
+        elif _prose_words(paragraph) > _MAX_FRONT_WORDS:
             # Prose this long is the abstract or the opening of the body, not a
             # list of names. Leaving it unclassified is what lets it be
             # translated like the rest of the page.

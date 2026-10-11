@@ -46,15 +46,16 @@ class DocumentAnchors:
     Named destinations for one document, grouped by page.
 
     Attributes:
-        citations (dict[int, list[float]]): Page index to the y coordinates of
-            bibliography entry anchors, sorted descending as they appear down
-            the page.
+        citations (dict[int, list[tuple[float, float]]]): Page index to the
+            ``(x, y)`` coordinates of bibliography entry anchors, sorted by
+            descending y as they appear down the page. The x is kept because a
+            two-column page needs it — see :meth:`is_citation`.
         list_items (dict[int, list[float]]): Page index to the y coordinates of
             enumerated list item anchors.
         available (bool): Whether the document carried any named destinations.
     """
 
-    citations: dict[int, list[float]] = field(default_factory=dict)
+    citations: dict[int, list[tuple[float, float]]] = field(default_factory=dict)
     list_items: dict[int, list[float]] = field(default_factory=dict)
     available: bool = False
 
@@ -99,10 +100,10 @@ class DocumentAnchors:
             where = target.get("to")
             if page is None or not where:
                 continue
-            y = float(where[1])
+            x, y = float(where[0]), float(where[1])
             head = name.split(".", 1)[0].lower()
             if head == "cite":
-                citations[page].append(y)
+                citations[page].append((x, y))
             elif head == "item":
                 items[page].append(y)
 
@@ -113,16 +114,17 @@ class DocumentAnchors:
                         sum(len(v) for v in citations.values()),
                         sum(len(v) for v in items.values()))
         return cls(
-            citations={k: sorted(v, reverse=True) for k, v in citations.items()},
+            citations={k: sorted(v, key=lambda p: -p[1]) for k, v in citations.items()},
             list_items={k: sorted(v, reverse=True) for k, v in items.items()},
             available=found,
         )
 
-    def is_citation(self, page: int, y0: float, y1: float) -> bool:
+    def is_citation(self, page: int, y0: float, y1: float,
+                    x0: float | None = None, x1: float | None = None) -> bool:
         """
-        中文：判断某页上的一个垂直区间是否位于文献区内。
+        中文：判断某页上的一个区域是否位于文献区内；双栏时只与同栏的条目比较。
 
-        Report whether a vertical span lies within the bibliography.
+        Report whether a paragraph's box lies within the bibliography.
 
         Containing an anchor is sufficient but not necessary. An anchor marks
         where an entry *begins*, and a long entry is often split into several
@@ -130,26 +132,46 @@ class DocumentAnchors:
         four continuation lines were translated for exactly this reason while
         their first lines were correctly preserved.
 
-        The bibliography is also contiguous: once it starts on a page, it runs
-        to the foot of that page. So anything below the topmost anchor is part
-        of it, while text above the first anchor — a conclusion section sharing
-        the page — is not, and keeps being translated.
+        The bibliography is contiguous *within a column*: once it starts, it
+        runs to the foot of that column. So anything below the topmost anchor
+        **of the same column** is part of it, while text above it — a
+        conclusion section sharing the page — is not, and keeps being
+        translated.
+
+        Comparing against the whole page instead is what broke that promise on
+        a two-column paper. On page 11 of arXiv:2608.09438 the bibliography
+        fills the right column from the very top, putting its highest anchor at
+        y 739.5, while the conclusion sits in the *left* column reaching only
+        y 718. Measured against the page the conclusion looked like it was
+        below the first entry, so the whole section — and the acknowledgements
+        under it — was preserved as English while the layout model had
+        correctly called both plain text.
 
         Args:
             page (int): Zero-based page index.
             y0 (float): Lower edge of the paragraph box, in PDF coordinates.
             y1 (float): Upper edge of the paragraph box.
+            x0 (float | None): Left edge of the box. Given together with
+                ``x1``, only anchors whose x falls inside that span are
+                considered, which is what confines the test to one column.
+                Omitting both restores the whole-page comparison.
+            x1 (float | None): Right edge of the box.
 
         Returns:
-            bool: ``True`` when the span lies in the bibliography.
+            bool: ``True`` when the box lies in the bibliography.
         """
         anchors = self.citations.get(page)
         if not anchors:
             return False
+        if x0 is not None and x1 is not None:
+            left, right = min(x0, x1) - _SLACK, max(x0, x1) + _SLACK
+            anchors = [a for a in anchors if left <= a[0] <= right]
+            if not anchors:
+                return False
         # PDF coordinates grow upward, so "below the first entry" means a
-        # smaller y than the highest anchor on the page.
-        # PDF 坐标向上增长，因此「在首条目之下」意味着 y 小于该页最高的锚点。
-        return max(y0, y1) <= anchors[0] + _SLACK
+        # smaller y than the highest anchor in this column.
+        # PDF 坐标向上增长，因此「在首条目之下」意味着 y 小于本栏最高的锚点。
+        return max(y0, y1) <= anchors[0][1] + _SLACK
 
     def items_within(self, page: int, y0: float, y1: float) -> list[float]:
         """

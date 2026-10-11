@@ -1340,6 +1340,61 @@ def serve(
     run_web(host=host, port=port, show=not no_browser, native=native)
 
 
+@app.command("fix-titles")
+def fix_titles(
+    apply: bool = typer.Option(False, "--apply", help="真正写入，默认只预览 / Write the changes"),
+) -> None:
+    """
+    中文：把历史里标题仍是 arXiv 编号的记录补成真标题。
+
+    Repair library entries whose title is still an arXiv identifier.
+
+    An identifier ends up in the title when the arXiv API was unreachable at
+    submission time — it rate-limits a burst of submissions, and the metadata
+    lookup used to fall straight back to the id. The PDFs are on disk and carry
+    their titles, so the repair needs no network. Previews by default; pass
+    ``--apply`` to write.
+    """
+    from pathlib import Path
+
+    from local_translator.config import get_paths as _paths
+    from local_translator.db import get_db
+    from local_translator.library import SOURCE_ARXIV
+    from local_translator.sources.arxiv import title_from
+
+    db = get_db(_paths().db_path)
+    rows = [dict(r) for r in db.list_documents(limit=100000)]
+    repaired = 0
+    for row in rows:
+        title = (row.get("title") or "").strip()
+        if row.get("source_kind") != SOURCE_ARXIV or not title:
+            continue
+        # A title that is nothing but an identifier: digits, dots and a version.
+        # 纯粹是编号的标题：只有数字、点和版本号。
+        if not title.replace(".", "").replace("v", "").isdigit():
+            continue
+        source = Path(row["source_path"])
+        if not source.is_file():
+            typer.echo(f"  ? {title}  源文件已不在，跳过")
+            continue
+        better = title_from({"title": title, "authors": "", "abs_url": ""}, source, title)
+        if better == title:
+            typer.echo(f"  ? {title}  PDF 里也没有可用标题")
+            continue
+        repaired += 1
+        typer.echo(f"  {'✓' if apply else '·'} {title} → {better}")
+        if apply:
+            with db.write() as conn:
+                conn.execute("UPDATE documents SET title = ? WHERE id = ?",
+                             (better, row["id"]))
+    if not repaired:
+        typer.secho("没有需要修复的记录", fg=typer.colors.GREEN)
+    elif apply:
+        typer.secho(f"\n已修复 {repaired} 条", fg=typer.colors.GREEN, bold=True)
+    else:
+        typer.secho(f"\n可修复 {repaired} 条，加 --apply 写入", bold=True)
+
+
 @app.command()
 def stop(
     timeout: float = typer.Option(20.0, help="等待优雅退出的秒数 / Seconds to wait"),

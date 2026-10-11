@@ -336,7 +336,8 @@ def _require_local_server(local: LocalModelSettings) -> None:
 
     url = f"http://{local.host}:{local.port}/health"
     try:
-        httpx.get(url, timeout=_PROBE_TIMEOUT)
+        response = httpx.get(url, timeout=_PROBE_TIMEOUT, trust_env=False)
+        response.raise_for_status()
     except httpx.HTTPError as exc:
         raise RuntimeError(
             f"本地模型服务没有在 {local.host}:{local.port} 上响应，这一趟不会译出任何内容。"

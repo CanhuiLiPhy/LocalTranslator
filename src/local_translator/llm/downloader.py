@@ -188,9 +188,21 @@ def download_file(
                     client, url, part, expected_size=expected_size, progress=progress
                 )
                 break
-            except httpx.HTTPStatusError:
-                # A bad status will not fix itself by retrying.
-                # 状态码错误重试也不会好转，直接抛出。
+            except httpx.HTTPStatusError as exc:
+                # 416 Range Not Satisfiable: the server's file has changed (e.g., a new
+                # model version was uploaded) and our .part file is now larger than the
+                # new file size. Delete the stale .part and restart from zero.
+                # 416 Range Not Satisfiable：服务器上的文件已变化（如新版模型上传），
+                # 而我们的 .part 文件比新文件大。删除过期的 .part 并从头开始下载。
+                if exc.response.status_code == 416:
+                    logger.warning(
+                        "Server file size changed (416); clearing stale .part and restarting"
+                    )
+                    part.unlink(missing_ok=True)
+                    stalled = 0
+                    continue
+                # Other 4xx errors won't fix themselves by retrying.
+                # 其他 4xx 错误重试也不会好转，直接抛出。
                 raise
             except (httpx.HTTPError, OSError) as exc:
                 after = part.stat().st_size if part.exists() else 0

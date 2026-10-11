@@ -1053,6 +1053,9 @@ class LocalMTTranslator(TranslationGuards, BaseTranslator):
             # llama-server 不校验密钥，但 SDK 要求非空。
             api_key="local",
             http_client=httpx.Client(
+                # Match the supervisor's direct connection: macOS system
+                # proxies may intercept loopback even without proxy env vars.
+                trust_env=False,
                 limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
                 timeout=settings.request_timeout,
             ),
